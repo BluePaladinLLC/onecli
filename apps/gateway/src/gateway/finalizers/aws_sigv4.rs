@@ -17,6 +17,7 @@ use super::super::body::buffer_body;
 
 const AWS_ACCESS_KEY_HEADER: &str = "x-onecli-aws-access-key-id";
 const AWS_SECRET_KEY_HEADER: &str = "x-onecli-aws-secret-access-key";
+const AWS_COMBINED_CREDENTIAL_HEADER: &str = "x-onecli-aws-combined-credential";
 const AWS_SESSION_TOKEN_HEADER: &str = "x-onecli-aws-session-token";
 const AWS_REGION_HEADER: &str = "x-onecli-aws-region";
 
@@ -29,36 +30,117 @@ pub(crate) struct AwsCredentials {
 }
 
 /// Extract and remove AWS credentials from internal headers.
-/// Returns `None` if any credential header is missing or invalid UTF-8.
-/// Validates all headers before removing any, preventing partial removal
-/// on malformed requests.
-pub(crate) fn extract_credentials(headers: &mut hyper::HeaderMap) -> Option<AwsCredentials> {
-    let access_key_id = headers
-        .get(AWS_ACCESS_KEY_HEADER)?
-        .to_str()
-        .ok()?
-        .to_owned();
-    let secret_access_key = headers
-        .get(AWS_SECRET_KEY_HEADER)?
-        .to_str()
-        .ok()?
-        .to_owned();
-    let region = headers.get(AWS_REGION_HEADER)?.to_str().ok()?.to_owned();
+///
+/// In addition to the normal discrete headers, the broker accepts a single
+/// `access-key-id,secret-access-key` value. That shape lets a 1Password field
+/// remain the atomic source of truth while the gateway splits it only in
+/// memory immediately before signing.
+///
+/// No AWS header means this request has no AWS credential attached. Any
+/// partial, malformed, or non-UTF-8 credential is an error rather than a
+/// pass-through: internal credential headers must never reach the upstream.
+pub(crate) fn extract_credentials(
+    headers: &mut hyper::HeaderMap,
+) -> anyhow::Result<Option<AwsCredentials>> {
+    let has_any = [
+        AWS_ACCESS_KEY_HEADER,
+        AWS_SECRET_KEY_HEADER,
+        AWS_COMBINED_CREDENTIAL_HEADER,
+        AWS_SESSION_TOKEN_HEADER,
+        AWS_REGION_HEADER,
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name));
+    if !has_any {
+        return Ok(None);
+    }
 
+    let discrete_access = headers.get(AWS_ACCESS_KEY_HEADER);
+    let discrete_secret = headers.get(AWS_SECRET_KEY_HEADER);
+    let combined = headers.get(AWS_COMBINED_CREDENTIAL_HEADER);
+
+    let (access_key_id, secret_access_key) = match (discrete_access, discrete_secret) {
+        (Some(access), Some(secret)) => (
+            access
+                .to_str()
+                .context("invalid AWS access-key header")?
+                .to_owned(),
+            secret
+                .to_str()
+                .context("invalid AWS secret-key header")?
+                .to_owned(),
+        ),
+        (None, None) => {
+            let combined = combined
+                .context("missing AWS credential headers")?
+                .to_str()
+                .context("invalid combined AWS credential header")?;
+            let (access, secret) = combined
+                .split_once(',')
+                .context("combined AWS credential must contain one comma")?;
+            anyhow::ensure!(
+                !secret.contains(','),
+                "combined AWS credential must contain exactly one comma"
+            );
+            anyhow::ensure!(
+                valid_access_key_id(access),
+                "combined AWS credential has an invalid access-key id"
+            );
+            anyhow::ensure!(
+                valid_secret_access_key(secret),
+                "combined AWS credential has an invalid secret access key"
+            );
+            (access.to_owned(), secret.to_owned())
+        }
+        _ => anyhow::bail!("incomplete discrete AWS credential headers"),
+    };
+
+    let region = headers
+        .get(AWS_REGION_HEADER)
+        .map(|v| {
+            v.to_str()
+                .context("invalid AWS region header")
+                .map(str::to_owned)
+        })
+        .transpose()?
+        .unwrap_or_default();
     let session_token = headers
-        .remove(AWS_SESSION_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
+        .get(AWS_SESSION_TOKEN_HEADER)
+        .map(|v| {
+            v.to_str()
+                .context("invalid AWS session-token header")
+                .map(str::to_owned)
+        })
+        .transpose()?;
 
+    // Remove every internal AWS header only after the full set has validated.
     headers.remove(AWS_ACCESS_KEY_HEADER);
     headers.remove(AWS_SECRET_KEY_HEADER);
+    headers.remove(AWS_COMBINED_CREDENTIAL_HEADER);
+    headers.remove(AWS_SESSION_TOKEN_HEADER);
     headers.remove(AWS_REGION_HEADER);
 
-    Some(AwsCredentials {
+    Ok(Some(AwsCredentials {
         access_key_id,
         secret_access_key,
         session_token,
         region,
-    })
+    }))
+}
+
+fn valid_access_key_id(value: &str) -> bool {
+    value.len() == 20
+        && (value.starts_with("AKIA") || value.starts_with("ASIA"))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+fn valid_secret_access_key(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'+' | b'='))
 }
 
 /// Parse the AWS service name and region from a hostname.
@@ -211,7 +293,7 @@ pub(crate) async fn finalize_request(
     headers: &mut hyper::HeaderMap,
     body: reqwest::Body,
 ) -> anyhow::Result<reqwest::Body> {
-    let creds = match extract_credentials(headers) {
+    let creds = match extract_credentials(headers)? {
         Some(c) => c,
         None => return Ok(body),
     };
@@ -310,7 +392,9 @@ mod tests {
         headers.insert(AWS_REGION_HEADER, HeaderValue::from_static("us-east-1"));
         headers.insert("content-type", HeaderValue::from_static("application/json"));
 
-        let creds = extract_credentials(&mut headers).expect("should extract");
+        let creds = extract_credentials(&mut headers)
+            .expect("valid headers")
+            .expect("should extract");
         assert_eq!(creds.access_key_id, "AKIAIOSFODNN7EXAMPLE");
         assert_eq!(creds.secret_access_key, "wJalrXUtnFEMI");
         assert_eq!(creds.session_token, None);
@@ -327,22 +411,59 @@ mod tests {
     fn extract_credentials_returns_none_when_missing() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
-        assert!(extract_credentials(&mut headers).is_none());
+        assert!(extract_credentials(&mut headers)
+            .expect("absence is valid")
+            .is_none());
     }
 
     #[test]
-    fn extract_credentials_no_partial_removal() {
+    fn extract_credentials_rejects_incomplete_headers_without_removal() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             AWS_ACCESS_KEY_HEADER,
             HeaderValue::from_static("AKIAIOSFODNN7EXAMPLE"),
         );
-        // Missing secret and region — should return None without removing access key
-        assert!(extract_credentials(&mut headers).is_none());
+        assert!(extract_credentials(&mut headers).is_err());
         assert!(
             headers.contains_key(AWS_ACCESS_KEY_HEADER),
             "should not remove headers when extraction fails"
         );
+    }
+
+    #[test]
+    fn extract_combined_credentials_splits_and_removes_internal_header() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            AWS_COMBINED_CREDENTIAL_HEADER,
+            HeaderValue::from_static(
+                "AKIAIOSFODNN7EXAMPLE,wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ),
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let creds = extract_credentials(&mut headers)
+            .expect("valid combined credential")
+            .expect("should extract");
+        assert_eq!(creds.access_key_id, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            creds.secret_access_key,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        );
+        assert_eq!(creds.region, "");
+        assert!(!headers.contains_key(AWS_COMBINED_CREDENTIAL_HEADER));
+        assert!(headers.contains_key("content-type"));
+    }
+
+    #[test]
+    fn extract_combined_credentials_fails_closed_on_malformed_value() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            AWS_COMBINED_CREDENTIAL_HEADER,
+            HeaderValue::from_static("AKIAIOSFODNN7EXAMPLE,too-short"),
+        );
+
+        assert!(extract_credentials(&mut headers).is_err());
+        assert!(headers.contains_key(AWS_COMBINED_CREDENTIAL_HEADER));
     }
 
     #[test]
@@ -362,7 +483,9 @@ mod tests {
         );
         headers.insert(AWS_REGION_HEADER, HeaderValue::from_static("us-west-2"));
 
-        let creds = extract_credentials(&mut headers).expect("should extract");
+        let creds = extract_credentials(&mut headers)
+            .expect("valid headers")
+            .expect("should extract");
         assert_eq!(creds.access_key_id, "ASIAIOSFODNN7EXAMPLE");
         assert_eq!(creds.secret_access_key, "wJalrXUtnFEMI");
         assert_eq!(creds.session_token.as_deref(), Some("FwoGZXIvYXdzEBY"));
