@@ -21,12 +21,19 @@ import { ServiceError } from "./errors";
 
 const INTEGRATION_NAME = "OneCLI";
 const INTEGRATION_VERSION = "1.0.0";
-/** Evict cached SDK clients idle longer than this. */
-const CLIENT_IDLE_TTL_MS = 30 * 60 * 1000;
+/**
+ * Hard upper bound on an SDK client's lifetime.
+ *
+ * The 1Password SDK may retain item material inside a client. An idle-only
+ * eviction policy therefore lets a busy broker serve a rotated value forever.
+ * Keep this below the gateway's resolved-value TTL so the two cache layers
+ * have a combined worst-case rotation window below one minute.
+ */
+const CLIENT_MAX_AGE_MS = 20 * 1000;
 
 interface CachedClient {
   client: Client;
-  lastUsed: number;
+  createdAt: number;
 }
 
 const clients = new Map<string, CachedClient>();
@@ -110,14 +117,15 @@ const getClient = async (token: string): Promise<Client> => {
   const now = Date.now();
   const key = tokenKey(token);
 
-  // Lazy idle-eviction (the set of active tokens is small).
+  // Lazy absolute-age eviction (the set of active tokens is small). Do not
+  // extend a client's lifetime on use: that recreates the stale-forever bug
+  // for a continuously active broker.
   for (const [k, c] of clients) {
-    if (now - c.lastUsed > CLIENT_IDLE_TTL_MS) clients.delete(k);
+    if (now - c.createdAt >= CLIENT_MAX_AGE_MS) clients.delete(k);
   }
 
   const cached = clients.get(key);
   if (cached) {
-    cached.lastUsed = now;
     return cached.client;
   }
 
@@ -138,7 +146,7 @@ const getClient = async (token: string): Promise<Client> => {
       `invalid 1Password service account token: ${errMessage(err)}`,
     );
   }
-  clients.set(key, { client, lastUsed: now });
+  clients.set(key, { client, createdAt: now });
   return client;
 };
 

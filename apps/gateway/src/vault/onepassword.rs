@@ -28,7 +28,10 @@ use tracing::info;
 use super::onepassword_api::{self, OpError};
 use super::{PairResult, ProviderStatus, VaultCredential, VaultError, VaultProvider};
 
-const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(60);
+// The Node SDK client is hard-rotated every 20s. Keeping this cache at 30s
+// bounds the combined stale-value window below one minute without requiring a
+// gateway or API restart after a 1Password rotation.
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const ERROR_COOLDOWN: Duration = Duration::from_secs(60);
 /// How long a successful `status` connectivity check is trusted before re-checking.
@@ -484,5 +487,12 @@ mod tests {
             op_err_to_vault(OpError::Transient("x".into())),
             VaultError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn resolved_value_cache_leaves_room_for_sdk_client_refresh() {
+        // The API layer's SDK-client maximum age is 20s. This pins the
+        // cross-layer production contract at no more than 50s total.
+        assert!(RESOLVE_CACHE_TTL + Duration::from_secs(20) <= Duration::from_secs(60));
     }
 }

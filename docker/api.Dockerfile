@@ -30,6 +30,14 @@ ENV PRISMA_SKIP_POSTINSTALL_GENERATE=true
 RUN pnpm install --frozen-lockfile
 
 # ──────────────────────────────────────────────
+# Optional focused regression-test target
+# ──────────────────────────────────────────────
+FROM deps AS rotation-test
+COPY --from=pruner /app/out/full/ .
+RUN pnpm --filter @onecli/api exec vitest run \
+  src/services/onepassword-service.test.ts
+
+# ──────────────────────────────────────────────
 # Stage 4: Build — generate the Prisma client, bundle the server to dist/
 # ──────────────────────────────────────────────
 FROM base AS builder
