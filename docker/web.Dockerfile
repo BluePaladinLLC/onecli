@@ -57,7 +57,10 @@ WORKDIR /app
 # tini as PID 1: Node is not an init (signal handling differs, orphans are
 # never reaped). See
 # https://github.com/nodejs/docker-node/blob/main/docs/BestPractices.md#handling-kernel-signals
-RUN apk add --no-cache tini
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+  && apk add --no-cache tini \
+  && rm -rf /usr/local/lib/node_modules/npm \
+  && rm -f /usr/local/bin/npm /usr/local/bin/npx
 ENTRYPOINT ["/sbin/tini", "--"]
 
 ENV NODE_ENV=production

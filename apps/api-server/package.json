@@ -16,7 +16,7 @@
     "@hono/node-server": "^1.14.1",
     "@onecli/api": "workspace:*",
     "@onecli/db": "workspace:*",
-    "hono": "^4.12.0",
+    "hono": "^4.12.25",
     "jose": "^6.0.11",
     "pino": "^10.3.1"
   },

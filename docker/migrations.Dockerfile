@@ -42,6 +42,13 @@ FROM node:22.23.2-alpine3.24 AS runner
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app
 
+# The migration runtime needs Node and the lockfile-pinned Prisma CLI, not npm.
+# Remove npm's unused package tree and apply the available Alpine TLS fixes so
+# scanner-reported vulnerabilities cannot be recovered from the final image.
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+  && rm -rf /usr/local/lib/node_modules/npm \
+  && rm -f /usr/local/bin/npm /usr/local/bin/npx
+
 ARG APP_VERSION=""
 ENV APP_VERSION=${APP_VERSION}
 

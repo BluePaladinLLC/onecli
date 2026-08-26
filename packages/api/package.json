@@ -38,13 +38,13 @@
     "@onecli/ssh-cert": "workspace:*",
     "better-auth": "1.6.26",
     "croner": "^10.0.1",
-    "hono": "^4.12.0",
+    "hono": "^4.12.25",
     "ioredis": "^5.10.1",
-    "nanoid": "^5.1.9",
+    "nanoid": "^5.1.16",
     "pino": "^10.3.1",
     "stripe": "^20.4.0",
     "tldts": "^7.4.4",
-    "undici": "^8.0.0",
+    "undici": "^8.9.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

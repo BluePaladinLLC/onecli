@@ -1,13 +1,6 @@
 "use client";
 
-import { useState } from "react";
-import {
-  Unlink,
-  Link as LinkIcon,
-  AlertCircle,
-  RefreshCw,
-  ExternalLink,
-} from "lucide-react";
+import { AlertCircle, RefreshCw } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -15,43 +8,16 @@ import {
   CardHeader,
   CardTitle,
 } from "@onecli/ui/components/card";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@onecli/ui/components/alert-dialog";
 import { Badge } from "@onecli/ui/components/badge";
-import { Button } from "@onecli/ui/components/button";
-import { Label } from "@onecli/ui/components/label";
 import { Skeleton } from "@onecli/ui/components/skeleton";
-import { SecretInput } from "@/components/secret-input";
 import {
   useVaultStatus,
-  useVaultDisconnect,
   type OnePasswordStatusData,
 } from "@/hooks/use-vault-status";
-import { useOnePasswordPair } from "@/hooks/use-onepassword";
 
 export const OnePasswordSetup = () => {
   const { status, loading, isPaired, isReady, fetchStatus } =
     useVaultStatus<OnePasswordStatusData>("onepassword");
-  const { pair, pairing } = useOnePasswordPair(fetchStatus);
-  const { disconnect, disconnecting } = useVaultDisconnect(
-    fetchStatus,
-    "onepassword",
-  );
-  const [token, setToken] = useState("");
-
-  const handlePair = async () => {
-    const success = await pair(token);
-    if (success) setToken("");
-  };
 
   if (loading) {
     return (
@@ -94,7 +60,8 @@ export const OnePasswordSetup = () => {
             </div>
             <CardDescription>
               Pick 1Password as the value source when adding a secret to resolve
-              its value on-demand. Nothing is stored on the server.
+              its value on-demand. Secret values and the 1Password bootstrap
+              credential are not stored in OneCLI&apos;s database.
             </CardDescription>
           </CardHeader>
           {hasError && (
@@ -117,91 +84,32 @@ export const OnePasswordSetup = () => {
           )}
         </Card>
 
-        {/* Danger zone */}
+        {/* Operator-managed runtime identity */}
         <Card>
           <CardHeader>
-            <CardTitle>Disconnect</CardTitle>
+            <CardTitle>Operator managed</CardTitle>
             <CardDescription>
-              Remove the connection to 1Password. Secrets that source their
-              value from 1Password will stop resolving until you reconnect.
+              The service-account identity is mounted at runtime. To rotate or
+              remove it, update the protected broker-host file and restart the
+              gateway. The dashboard never receives or stores that token.
             </CardDescription>
           </CardHeader>
-          <CardContent>
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button variant="outline" className="w-fit" size="sm">
-                  <Unlink className="size-3.5" />
-                  Disconnect
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Disconnect 1Password?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    This removes the stored service account token. Secrets will
-                    no longer be resolved until you reconnect.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    variant="destructive"
-                    onClick={disconnect}
-                    disabled={disconnecting}
-                  >
-                    {disconnecting ? "Disconnecting..." : "Disconnect"}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          </CardContent>
         </Card>
       </div>
     );
   }
 
-  // Not paired — connect form
+  // The broker owns the service-account identity. It is never pasted here.
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Connect 1Password</CardTitle>
+        <CardTitle>1Password is not configured</CardTitle>
         <CardDescription>
-          Paste a 1Password Service Account token to resolve secrets on-demand.{" "}
-          <a
-            href="https://developer.1password.com/docs/service-accounts/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-foreground inline-flex items-center gap-0.5 underline underline-offset-2 hover:no-underline"
-          >
-            Setup guide
-            <ExternalLink className="size-3" />
-          </a>
+          The broker operator must mount a read-only 1Password service-account
+          token and restart the gateway. This screen intentionally cannot accept
+          a token, so OneCLI cannot persist it in the database or backups.
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="grid gap-2">
-          <Label htmlFor="op-token">Service Account Token</Label>
-          <SecretInput
-            id="op-token"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            placeholder="ops_..."
-          />
-          <p className="text-muted-foreground text-xs">
-            Create a service account in 1Password and grant it access to the
-            vaults you want to use.
-          </p>
-        </div>
-        <Button
-          onClick={handlePair}
-          loading={pairing}
-          disabled={!token.trim()}
-          className="w-fit"
-        >
-          <LinkIcon className="size-3.5" />
-          {pairing ? "Connecting..." : "Connect 1Password"}
-        </Button>
-      </CardContent>
     </Card>
   );
 };
