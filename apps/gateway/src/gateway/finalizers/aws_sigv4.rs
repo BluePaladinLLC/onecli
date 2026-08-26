@@ -12,6 +12,7 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use hyper::header::{HeaderName, HeaderValue};
+use ring::digest::{digest, SHA256};
 
 use super::super::body::buffer_body;
 
@@ -164,6 +165,9 @@ pub(crate) fn parse_service_region<'a>(
     if let Some(rest) = hostname.strip_suffix(".amazonaws.com") {
         let parts: Vec<&str> = rest.split('.').collect();
         return match parts.as_slice() {
+            [_, service] if *service == "s3" || service.starts_with("s3-") => {
+                (service, global_service_region(service, default_region))
+            }
             [service, region] => (service, region),
             [service] => (service, global_service_region(service, default_region)),
             [_, service, region] if *service == "s3" || service.starts_with("s3-") => {
@@ -221,6 +225,18 @@ pub(crate) fn sign_request(
         if let Ok(host_val) = HeaderValue::from_str(hostname) {
             headers.insert("host", host_val);
         }
+    }
+
+    // S3 requires this header on SigV4 requests. The aws-sigv4 crate uses the
+    // payload checksum while computing the canonical request, but does not add
+    // the header to the outgoing map for this signing path, so materialize it
+    // before the header set is captured and signed.
+    if service == "s3" {
+        let checksum = hex::encode(digest(&SHA256, body).as_ref());
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&checksum).context("invalid S3 payload checksum")?,
+        );
     }
 
     let identity = Credentials::new(
@@ -354,6 +370,13 @@ mod tests {
             parse_service_region("my-bucket.s3.us-west-2.amazonaws.com", "us-east-1");
         assert_eq!(svc, "s3");
         assert_eq!(region, "us-west-2");
+    }
+
+    #[test]
+    fn parse_s3_global_virtual_hosted() {
+        let (svc, region) = parse_service_region("my-bucket.s3.amazonaws.com", "us-east-1");
+        assert_eq!(svc, "s3");
+        assert_eq!(region, "us-east-1");
     }
 
     #[test]
@@ -495,5 +518,64 @@ mod tests {
         assert!(!headers.contains_key(AWS_SECRET_KEY_HEADER));
         assert!(!headers.contains_key(AWS_SESSION_TOKEN_HEADER));
         assert!(!headers.contains_key(AWS_REGION_HEADER));
+    }
+
+    #[test]
+    fn sign_s3_request_adds_and_signs_required_payload_checksum() {
+        let mut headers = hyper::HeaderMap::new();
+        let creds = AwsCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+        };
+
+        sign_request(
+            "GET",
+            "https://example-bucket.s3.amazonaws.com/?list-type=2",
+            &mut headers,
+            b"",
+            &creds,
+            "example-bucket.s3.amazonaws.com",
+        )
+        .expect("S3 request should sign");
+
+        assert_eq!(
+            headers
+                .get("x-amz-content-sha256")
+                .expect("required S3 checksum header")
+                .to_str()
+                .expect("ASCII checksum"),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert!(headers
+            .get("authorization")
+            .expect("authorization header")
+            .to_str()
+            .expect("ASCII authorization")
+            .contains("x-amz-content-sha256"));
+    }
+
+    #[test]
+    fn sign_non_s3_request_does_not_add_s3_payload_checksum_header() {
+        let mut headers = hyper::HeaderMap::new();
+        let creds = AwsCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+        };
+
+        sign_request(
+            "GET",
+            "https://ec2.us-east-1.amazonaws.com/",
+            &mut headers,
+            b"",
+            &creds,
+            "ec2.us-east-1.amazonaws.com",
+        )
+        .expect("EC2 request should sign");
+
+        assert!(!headers.contains_key("x-amz-content-sha256"));
     }
 }
