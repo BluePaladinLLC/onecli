@@ -29,6 +29,7 @@ export interface BitwardenStatusData {
 
 export interface OnePasswordStatusData {
   last_error: string | null;
+  managed_externally: boolean;
 }
 
 export const useVaultStatus = <T = unknown>(provider: string = "bitwarden") => {

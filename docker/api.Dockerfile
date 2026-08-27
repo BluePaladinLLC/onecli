@@ -30,6 +30,14 @@ ENV PRISMA_SKIP_POSTINSTALL_GENERATE=true
 RUN pnpm install --frozen-lockfile
 
 # ──────────────────────────────────────────────
+# Optional focused regression-test target
+# ──────────────────────────────────────────────
+FROM deps AS rotation-test
+COPY --from=pruner /app/out/full/ .
+RUN pnpm --filter @onecli/api exec vitest run \
+  src/services/onepassword-service.test.ts
+
+# ──────────────────────────────────────────────
 # Stage 4: Build — generate the Prisma client, bundle the server to dist/
 # ──────────────────────────────────────────────
 FROM base AS builder
@@ -56,7 +64,9 @@ RUN echo "node-linker=hoisted" >> .npmrc \
 # never busts the expensive install cache; generate needs it to produce the
 # runtime client (.prisma/client + engine) inside this node_modules.
 COPY --from=pruner /app/out/full/packages/db/prisma ./packages/db/prisma
-RUN pnpm --filter @onecli/db generate
+RUN pnpm --filter @onecli/db generate \
+  && rm -rf node_modules/prisma node_modules/@prisma/config \
+    node_modules/deepmerge-ts node_modules/effect
 
 # ──────────────────────────────────────────────
 # Stage 6: Production runner
@@ -70,7 +80,10 @@ WORKDIR /app
 
 # tini as PID 1: Node is not an init (signal handling differs, orphans are
 # never reaped).
-RUN apk add --no-cache tini
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+  && apk add --no-cache tini \
+  && rm -rf /usr/local/lib/node_modules/npm \
+  && rm -f /usr/local/bin/npm /usr/local/bin/npx
 ENTRYPOINT ["/sbin/tini", "--"]
 
 # NODE_ENV=production is load-bearing beyond convention: the pino loggers fall

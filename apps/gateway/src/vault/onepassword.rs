@@ -1,7 +1,10 @@
 //! 1Password vault provider.
 //!
-//! Owns the connection — the encrypted Service-Account token stored in
-//! `vault_connection` — plus the per-workspace session and a small resolve cache.
+//! The Service Account token is injected from a runtime-only file and held only
+//! in process memory. It is never accepted from the dashboard and is never
+//! written to PostgreSQL, so database snapshots cannot become a second secret
+//! store. The token file is the broker's unavoidable bootstrap identity; its
+//! path comes from `ONEPASSWORD_SERVICE_ACCOUNT_TOKEN_FILE`.
 //! 1Password is **not** a hostname-matched vault racer like Bitwarden; it is a
 //! *value source* for explicit secrets. A secret with `value_source =
 //! "onepassword"` carries an `op://vault/item/field` reference that the
@@ -12,22 +15,23 @@
 //! vaults/items/fields for the picker) is delegated to the Node "1Password SDK
 //! service" via [`super::onepassword_api`]; the gateway never runs the `op` CLI.
 
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::onepassword_api::{self, OpError};
 use super::{PairResult, ProviderStatus, VaultCredential, VaultError, VaultProvider};
-use crate::crypto::CryptoService;
-use crate::db;
 
-const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(60);
+// The Node SDK client is hard-rotated every 20s. Keeping this cache at 30s
+// bounds the combined stale-value window below one minute without requiring a
+// gateway or API restart after a 1Password rotation.
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const ERROR_COOLDOWN: Duration = Duration::from_secs(60);
 /// How long a successful `status` connectivity check is trusted before re-checking.
@@ -37,14 +41,30 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 // ── Config & session types ──────────────────────────────────────────────
 
-/// Persisted in `vault_connection.connection_data`. Rows written before the
-/// value-source refactor also carry a `mappings` key; serde ignores it.
-///
-/// Deliberately no `Debug`/`Clone`: the struct carries only a credential (the
-/// encrypted SA token), so it must not be `{:?}`-logged or cloned around.
-#[derive(Serialize, Deserialize)]
-pub(crate) struct OnePasswordConfig {
-    pub encrypted_service_account_token: String,
+const TOKEN_FILE_ENV: &str = "ONEPASSWORD_SERVICE_ACCOUNT_TOKEN_FILE";
+
+fn load_service_account_token(path: &Path) -> Result<Arc<str>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading metadata for {TOKEN_FILE_ENV}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(anyhow!("{TOKEN_FILE_ENV} must name a regular, non-symlink file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o007 != 0 || mode & 0o022 != 0 {
+            return Err(anyhow!(
+                "{TOKEN_FILE_ENV} permissions are too broad ({mode:o}); require no other access and no group/other write"
+            ));
+        }
+    }
+    let token = fs::read_to_string(path).with_context(|| format!("reading {TOKEN_FILE_ENV}"))?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(anyhow!("{TOKEN_FILE_ENV} is empty"));
+    }
+    Ok(Arc::<str>::from(token))
 }
 
 /// A cached `op://` resolution. `value: None` is a negative cache entry (the
@@ -55,7 +75,7 @@ struct CachedRef {
 }
 
 struct OnePasswordSession {
-    decrypted_sa_token: String,
+    service_account_token: Arc<str>,
     /// `op://vault/item/field` → resolved value, with positive/negative TTLs.
     ref_cache: DashMap<String, CachedRef>,
     last_used: Mutex<Instant>,
@@ -77,15 +97,27 @@ impl OnePasswordSession {
 }
 
 pub(crate) struct OnePasswordVaultProvider {
-    pool: PgPool,
-    crypto: Arc<CryptoService>,
+    service_account_token: Option<Arc<str>>,
     sessions: Arc<DashMap<String, Arc<OnePasswordSession>>>,
 }
 
 // ── Constructor with idle-session eviction ──────────────────────────────
 
 impl OnePasswordVaultProvider {
-    pub fn new(pool: PgPool, crypto: Arc<CryptoService>) -> Self {
+    pub fn from_env() -> Result<Self> {
+        let service_account_token = match std::env::var_os(TOKEN_FILE_ENV) {
+            None => None,
+            Some(path) => Some(load_service_account_token(Path::new(&path))?),
+        };
+        Ok(Self::new(service_account_token))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_service_account() -> Self {
+        Self::new(None)
+    }
+
+    fn new(service_account_token: Option<Arc<str>>) -> Self {
         let sessions: Arc<DashMap<String, Arc<OnePasswordSession>>> = Arc::new(DashMap::new());
 
         let sessions_clone = Arc::clone(&sessions);
@@ -113,14 +145,13 @@ impl OnePasswordVaultProvider {
         });
 
         Self {
-            pool,
-            crypto,
+            service_account_token,
             sessions,
         }
     }
 
-    /// Load an existing session from memory or DB. Returns `None` if the workspace
-    /// has never paired. Decrypts the SA token into memory (held for resolution).
+    /// Load a session from memory or from the externally injected token. The
+    /// workspace key isolates value caches; the bootstrap identity is shared.
     async fn load_session(
         &self,
         workspace_id: &str,
@@ -130,33 +161,12 @@ impl OnePasswordVaultProvider {
             return Ok(Some(Arc::clone(&session)));
         }
 
-        let row = match db::find_vault_connection(&self.pool, workspace_id, "onepassword").await {
-            Ok(Some(row)) => row,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                return Err(VaultError::Internal(format!(
-                    "failed to load vault connection: {e}"
-                )))
-            }
+        let Some(sa_token) = self.service_account_token.as_ref() else {
+            return Ok(None);
         };
 
-        let connection_data = row.connection_data.ok_or_else(|| {
-            VaultError::Internal("vault connection has no connection_data".into())
-        })?;
-        let config: OnePasswordConfig = serde_json::from_value(connection_data)
-            .map_err(|e| VaultError::Internal(format!("malformed connection_data: {e}")))?;
-
-        let sa_token = self
-            .crypto
-            .decrypt(&config.encrypted_service_account_token)
-            .await
-            .map_err(|e| {
-                warn!(workspace_id, "failed to decrypt service account token: {e}");
-                VaultError::Internal("token decryption failed; re-pair to fix".into())
-            })?;
-
         let session = Arc::new(OnePasswordSession {
-            decrypted_sa_token: sa_token,
+            service_account_token: Arc::clone(sa_token),
             ref_cache: DashMap::new(),
             last_used: Mutex::new(Instant::now()),
             last_error: Mutex::new(None),
@@ -204,7 +214,7 @@ impl OnePasswordVaultProvider {
             ));
         }
 
-        match onepassword_api::resolve(&session.decrypted_sa_token, op_ref).await {
+        match onepassword_api::resolve(&session.service_account_token, op_ref).await {
             Ok(value) if !value.is_empty() => {
                 *session.last_error.lock().expect("session lock poisoned") = None;
                 session.ref_cache.insert(
@@ -254,7 +264,7 @@ impl OnePasswordVaultProvider {
         workspace_id: &str,
     ) -> Result<serde_json::Value, VaultError> {
         let session = self.picker_session(workspace_id).await?;
-        onepassword_api::list_vaults(&session.decrypted_sa_token)
+        onepassword_api::list_vaults(&session.service_account_token)
             .await
             .map_err(op_err_to_vault)
     }
@@ -265,7 +275,7 @@ impl OnePasswordVaultProvider {
         vault_id: &str,
     ) -> Result<serde_json::Value, VaultError> {
         let session = self.picker_session(workspace_id).await?;
-        onepassword_api::list_items(&session.decrypted_sa_token, vault_id)
+        onepassword_api::list_items(&session.service_account_token, vault_id)
             .await
             .map_err(op_err_to_vault)
     }
@@ -277,7 +287,7 @@ impl OnePasswordVaultProvider {
         item_id: &str,
     ) -> Result<serde_json::Value, VaultError> {
         let session = self.picker_session(workspace_id).await?;
-        onepassword_api::list_fields(&session.decrypted_sa_token, vault_id, item_id)
+        onepassword_api::list_fields(&session.service_account_token, vault_id, item_id)
             .await
             .map_err(op_err_to_vault)
     }
@@ -302,34 +312,21 @@ impl VaultProvider for OnePasswordVaultProvider {
         "onepassword"
     }
 
-    async fn pair(&self, workspace_id: &str, params: &serde_json::Value) -> Result<PairResult> {
-        let token = params
-            .get("service_account_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing service_account_token"))?;
+    async fn pair(&self, workspace_id: &str, _params: &serde_json::Value) -> Result<PairResult> {
+        let token = self.service_account_token.as_ref().ok_or_else(|| {
+            anyhow!(
+                "1Password is operator-managed; configure {TOKEN_FILE_ENV} and restart the gateway"
+            )
+        })?;
 
-        // Validate the token via the Node SDK service before persisting it.
+        // Pairing is only a live validation of the externally managed token.
+        // There is deliberately no database write on this path.
         onepassword_api::validate(token)
             .await
             .map_err(|e| anyhow!("token validation failed: {e}"))?;
-
-        let encrypted = self
-            .crypto
-            .encrypt(token)
-            .await
-            .map_err(|e| anyhow!("encryption failed: {e}"))?;
-
-        let config = OnePasswordConfig {
-            encrypted_service_account_token: encrypted,
-        };
-        let cd = serde_json::to_value(&config)?;
-        db::upsert_vault_connection(&self.pool, workspace_id, "onepassword", "paired", Some(&cd))
-            .await?;
-
-        // Drop any cached session so the next request reloads the new token.
         self.sessions.remove(workspace_id);
         Ok(PairResult {
-            display_name: Some("1Password".into()),
+            display_name: Some("1Password (operator managed)".into()),
         })
     }
 
@@ -351,14 +348,22 @@ impl VaultProvider for OnePasswordVaultProvider {
                 return ProviderStatus {
                     connected: false,
                     name: None,
-                    status_data: None,
+                    status_data: Some(serde_json::json!({
+                        "managed_externally": true,
+                        "last_error": format!(
+                            "1Password bootstrap is not configured; set {TOKEN_FILE_ENV} and restart the gateway"
+                        ),
+                    })),
                 }
             }
             Err(e) => {
                 return ProviderStatus {
                     connected: false,
                     name: None,
-                    status_data: Some(serde_json::json!({ "last_error": e.to_string() })),
+                    status_data: Some(serde_json::json!({
+                        "managed_externally": true,
+                        "last_error": e.to_string(),
+                    })),
                 }
             }
         };
@@ -373,7 +378,10 @@ impl VaultProvider for OnePasswordVaultProvider {
         ProviderStatus {
             connected,
             name: None,
-            status_data: Some(serde_json::json!({ "last_error": last_err })),
+            status_data: Some(serde_json::json!({
+                "managed_externally": true,
+                "last_error": last_err,
+            })),
         }
     }
 
@@ -381,7 +389,9 @@ impl VaultProvider for OnePasswordVaultProvider {
         if let Some((_, session)) = self.sessions.remove(workspace_id) {
             session.ref_cache.clear();
         }
-        Ok(())
+        Err(anyhow!(
+            "1Password is operator-managed; remove the runtime token file and restart the gateway"
+        ))
     }
 }
 
@@ -401,7 +411,7 @@ async fn live_check(session: &OnePasswordSession) -> bool {
     {
         return true;
     }
-    match onepassword_api::validate(&session.decrypted_sa_token).await {
+    match onepassword_api::validate(&session.service_account_token).await {
         Ok(()) => {
             *session.last_error.lock().expect("session lock poisoned") = None;
             *session.last_ok.lock().expect("session lock poisoned") = Some(Instant::now());
@@ -430,26 +440,35 @@ fn op_err_to_vault(e: OpError) -> VaultError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn config_round_trip() {
-        let config = OnePasswordConfig {
-            encrypted_service_account_token: "iv:tag:ct".into(),
-        };
-        let json = serde_json::to_value(&config).unwrap();
-        let back: OnePasswordConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(back.encrypted_service_account_token, "iv:tag:ct");
+    #[tokio::test]
+    async fn unconfigured_provider_holds_no_service_account_token() {
+        let provider = OnePasswordVaultProvider::without_service_account();
+        assert!(provider.service_account_token.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn config_ignores_legacy_mappings() {
-        // Rows written before the value-source refactor carry a `mappings` key.
-        // It must deserialize cleanly (ignored) so existing connections keep working.
-        let json = serde_json::json!({
-            "encrypted_service_account_token": "iv:tag:ct",
-            "mappings": { "api.anthropic.com": "op://API Keys/Anthropic/credential" },
-        });
-        let config: OnePasswordConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(config.encrypted_service_account_token, "iv:tag:ct");
+    fn bootstrap_file_requires_private_permissions_and_nonempty_value() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "onecli-onepassword-bootstrap-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        fs::write(&path, "synthetic-test-value\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(&*load_service_account_token(&path).unwrap(), "synthetic-test-value");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_service_account_token(&path).is_err());
+
+        fs::write(&path, "\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_service_account_token(&path).is_err());
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -468,5 +487,12 @@ mod tests {
             op_err_to_vault(OpError::Transient("x".into())),
             VaultError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn resolved_value_cache_leaves_room_for_sdk_client_refresh() {
+        // The API layer's SDK-client maximum age is 20s. This pins the
+        // cross-layer production contract at no more than 50s total.
+        assert!(RESOLVE_CACHE_TTL + Duration::from_secs(20) <= Duration::from_secs(60));
     }
 }

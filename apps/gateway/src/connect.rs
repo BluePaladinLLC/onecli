@@ -1681,10 +1681,7 @@ impl PolicyEngine {
             CryptoService::from_base64_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
                 .expect("test key"),
         );
-        let onepassword = Arc::new(OnePasswordVaultProvider::new(
-            pool.clone(),
-            Arc::clone(&crypto),
-        ));
+        let onepassword = Arc::new(OnePasswordVaultProvider::without_service_account());
         PolicyEngine {
             pool,
             crypto,

@@ -17,7 +17,20 @@ COPY apps/gateway/ .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ──────────────────────────────────────────────
-# Stage 1c: Build Rust gateway
+# Stage 1c: Optional locked test target
+# ──────────────────────────────────────────────
+FROM chef AS test
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY apps/gateway/ .
+# A gateway corpus test uses a repository-relative include path. The production
+# builder only copies apps/gateway, so provide that shared fixture explicitly in
+# the location the compile-time include resolves to inside this image.
+COPY packages/api/src/services/policy-translation/corpus/policy-cases.json /packages/api/src/services/policy-translation/corpus/policy-cases.json
+RUN cargo test --release --locked
+
+# ──────────────────────────────────────────────
+# Stage 1d: Build Rust gateway
 # ──────────────────────────────────────────────
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
@@ -35,7 +48,8 @@ FROM alpine:3.24 AS runner
 LABEL org.opencontainers.image.licenses="Apache-2.0 AND LicenseRef-OneCLI-Enterprise"
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+  && apk add --no-cache ca-certificates
 
 # Build version read by the gateway at runtime (empty → gateway falls back to
 # its compile-time crate version).

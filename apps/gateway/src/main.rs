@@ -223,10 +223,7 @@ async fn main() -> Result<()> {
     // Build the 1Password provider once and share the Arc: the PolicyEngine
     // resolves `op://` secret values through it, and the VaultService registers
     // it as a provider (connection holder for pair/status/picker).
-    let onepassword = Arc::new(OnePasswordVaultProvider::new(
-        pool.clone(),
-        Arc::clone(&crypto),
-    ));
+    let onepassword = Arc::new(OnePasswordVaultProvider::from_env()?);
 
     let policy_engine = Arc::new(PolicyEngine {
         pool,
