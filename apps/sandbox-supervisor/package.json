@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@1jehuang/jcode-sdk": "1.1.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@onecli/agent-protocol": "workspace:*",
     "zod": "^4.3.6"
   },
